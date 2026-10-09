@@ -187,6 +187,8 @@ local config = {
     survival_eat_threshold   = 0.4,  -- 饥饿超过此值（0~1）：自动吃背包里的食物
     survival_drink_threshold = 0.5,  -- 口渴超过此值（0~1）：自动喝水
     survival_check_interval_ms = 3000, -- 生存自动化检查间隔（毫秒），防止动作队列刷屏
+    carry_warn_ratio         = 0.8,  -- 负重达到上限的此比例：拒绝继续搜刮（防止贪到跑不动）
+    carry_drop_ratio         = 1.0,  -- 负重超过上限的此比例：反射层自动丢弃低价值物品减重
 }
 
 -- 文件读写工具（相对根目录 = 用户目录/Zomboid/Lua/）
@@ -249,6 +251,8 @@ local lastPursueMs = 0                 -- 上次下发追击移动指令的时�
 local manualTarget = nil               -- attack_nearest 锁定的目标僵尸（nil 表示当前无主动攻击目标）
 local lastActionTimestamp = 0          -- 动作文件的 updated_at，用于识别新决策
 local lastSurvivalMs = 0               -- 上次执行生存自动化检查的时间戳
+local lastWeightMs = 0                 -- 上次执行背包减重检查的时间戳
+local deathHandled = false             -- 本局死亡是否已写局总结（防止事件/轮询重复写）
 
 -- ---------------------------------------------------------------------------
 -- 僵尸探测
@@ -407,8 +411,10 @@ local function collectInventory(player)
     end
     return {
         inventory = top,        -- 空背包时为空数组（本文件 JSON 编码器会编成 {}，可接受）
-        carry_weight = math.floor(inv:getCapacityWeight() * 10 + 0.5) / 10, -- 保留 1 位小数
-        carry_max = inv:getCapacity(),
+        -- 负重口径与 UI 重量条一致：角色层 API（B41 已验证），
+        -- 容器层 getCapacityWeight 语义不符（返回的是容量而非当前重量），勿用
+        carry_weight = math.floor(player:getInventoryWeight() * 10 + 0.5) / 10, -- 当前负重，保留 1 位小数
+        carry_max = player:getMaxWeight(),    -- 负重上限（受力量/特质/伤病影响）
     }
 end
 
@@ -427,6 +433,7 @@ local function collectState(player, nearestDist)
         endurance = math.floor(stats:getEndurance() * 100),
         panic = math.floor(stats:getPanic()),
         infected = body:IsInfected(),
+        dead = player:isDead(),               -- 死亡标记：桥接侧据此感知一局结束
         hour = getGameTime():getHour(),
         nearby_zombies = countZombies(player, config.zombie_danger_distance * 3),
         nearest_zombie_dist = nearestDist == math.huge and -1 or math.floor(nearestDist * 10) / 10,
@@ -454,6 +461,13 @@ local lootCategories = {
 }
 
 local function doLoot(player)
+    -- 负重守卫：超过八成上限就拒绝搜刮（与种子经验第 1 条一致），防止贪到跑不动
+    local maxW = player:getMaxWeight()
+    if maxW > 0 and player:getInventoryWeight() > maxW * config.carry_warn_ratio then
+        lastActionResult = "failed: 负重超过八成，停止搜刮"
+        return
+    end
+
     local sq = player:getCurrentSquare()
     if not sq then
         lastActionResult = "failed: 无法获取当前格子"
@@ -657,6 +671,55 @@ local function autoSurvival(player, nowMs)
 end
 
 -- ---------------------------------------------------------------------------
+-- 背包管理（反射层）：超重时自动把低价值物品扔到地面减重
+-- 「低价值」= 不在 lootCategories 白名单、不是生存刚需（水/绷带）、不在手上、
+-- 未被收藏的物品。走原版 ISDropWorldItemAction 扔到地面而不是直接销毁，
+-- 之后还能回来捡；每次检查最多扔 1 件，与生存自动化共用节流节奏。
+-- ---------------------------------------------------------------------------
+
+-- 找最该扔的物品：可扔物品里最重的一件
+local function findDropCandidate(player)
+    local items = player:getInventory():getItems()
+    local worst, worstWeight = nil, 0
+    for i = 0, items:size() - 1 do
+        local item = items:get(i)
+        if not lootCategories[item:getCategory()]         -- 白名单类别（食物/药品/武器/包/书）不扔
+           and not item:isWaterSource()                   -- 水容器是生存刚需，不扔
+           and not item:isCanBandage()                    -- 绷带同理
+           and item ~= player:getPrimaryHandItem()        -- 手上的装备不扔
+           and item ~= player:getSecondaryHandItem()
+           and not item:isFavorite() then                 -- 玩家收藏的物品不扔
+            local w = item:getActualWeight()
+            if w > worstWeight then worst, worstWeight = item, w end
+        end
+    end
+    return worst
+end
+
+-- 背包管理主入口：负重超过 carry_drop_ratio 时扔一件最低价值物品
+local function autoManageWeight(player, nowMs)
+    if nowMs - lastWeightMs < config.survival_check_interval_ms then return end
+    lastWeightMs = nowMs
+    if emergencyActive then return end     -- 逃命中动作队列会被 flee 反复清空，扔了也完不成
+    if player:isInAction() then return end -- 正在执行动作时不打断
+
+    local maxW = player:getMaxWeight()
+    if maxW <= 0 then return end
+    local ratio = player:getInventoryWeight() / maxW
+    if ratio < config.carry_drop_ratio then return end
+
+    local item = findDropCandidate(player)
+    if not item then
+        logEvent("auto_drop_skip", { reason = "背包全是刚需物品，无物可扔", ratio = math.floor(ratio * 100) / 100 })
+        return
+    end
+    local sq = player:getCurrentSquare()
+    if not sq then return end
+    ISTimedActionQueue.add(ISDropWorldItemAction:new(player, item, sq, 0.0, 0.0, 0.0, 0, false))
+    logEvent("auto_drop", { item = item:getType(), weight = math.floor(item:getActualWeight() * 100) / 100, ratio = math.floor(ratio * 100) / 100 })
+end
+
+-- ---------------------------------------------------------------------------
 -- 动作执行：读取 DeepSeekAI_action.json，执行 LLM 的高层决策（非紧急时）
 -- ---------------------------------------------------------------------------
 local function executeAction(player)
@@ -724,12 +787,77 @@ local function executeAction(player)
 end
 
 -- ---------------------------------------------------------------------------
+-- 死亡检测与局总结：OnPlayerDeath 事件 + onTick 轮询 isDead 兜底（双保险）
+-- 局总结写入复盘日志（type=death_summary），是阶段三调参的「一局结束」
+-- 结构化信号：存活时长/击杀数/死因代理指标/死亡位置。
+-- 注意 B41 没有可靠的死因 API（getCauseOfDeath 不存在），只能用代理指标推断。
+-- ---------------------------------------------------------------------------
+
+-- 用可验证的代理指标推断死因（火烧 > Knox 感染 > 外伤）
+local function guessDeathCause(player)
+    local body = player:getBodyDamage()
+    if body:IsOnFire() then return "fire" end
+    if body:IsInfected() then return "knox_infection" end
+    return "trauma" -- 最常见的直接死因（僵尸围殴/坠落等），无法进一步区分
+end
+
+-- 新一局开始时重置全部运行时状态（复活/新角色）
+local function resetRuntimeState()
+    emergencyActive = false
+    manualTarget = nil
+    currentAction = "idle"
+    lastActionResult = "none"
+    lastActionTimestamp = 0
+    lastFleeMs = 0
+    lastPursueMs = 0
+    lastSurvivalMs = 0
+    lastWeightMs = 0
+end
+
+-- 写局总结并收尾（幂等：同一局只写一次）
+local function writeDeathSummary(player, source)
+    if deathHandled then return end
+    deathHandled = true
+    local body = player:getBodyDamage()
+    logEvent("death_summary", {
+        source = source, -- event=OnPlayerDeath 事件；tick=onTick 轮询兜底
+        survived_hours = math.floor(player:getHoursSurvived() * 100) / 100,
+        survived_nights = getGameTime():getNightsSurvived(),
+        zombie_kills = player:getZombieKills(),
+        cause = guessDeathCause(player),
+        infected = body:IsInfected(),
+        x = math.floor(player:getX()),
+        y = math.floor(player:getY()),
+        game_hour = getGameTime():getHour(),
+    })
+    -- 最后写一次状态（dead=true），桥接侧据此停止 LLM 调用并记录一局结束
+    writeJsonFile("DeepSeekAI_state.json", collectState(player, math.huge))
+    resetRuntimeState()
+    print("[DeepSeekAI] 玩家死亡，局总结已写入复盘日志（来源: " .. source .. "）")
+end
+
+-- 事件通道：死亡瞬间触发（参数为死亡的本地玩家，参照 The Only Cure 模组用法）
+local function onPlayerDeath(player)
+    if player ~= getSpecificPlayer(0) then return end -- 只跟踪主玩家（兼容分屏）
+    writeDeathSummary(player, "event")
+end
+Events.OnPlayerDeath.Add(onPlayerDeath)
+
+-- ---------------------------------------------------------------------------
 -- 主循环：每个游戏 tick 触发
--- 执行顺序严格固定：紧急逻辑 -> 生存自动化 -> 状态写入 -> LLM 动作执行
+-- 执行顺序严格固定：死亡兜底 -> 紧急逻辑 -> 生存自动化 -> 背包管理 -> 状态写入 -> LLM 动作执行
 -- ---------------------------------------------------------------------------
 local function onTick()
     local player = getSpecificPlayer(0)
     if not player then return end -- 存档未加载完成时跳过
+
+    -- 0) 死亡兜底：事件因故未触发时，轮询 isDead 也能补写局总结；
+    --    死亡后不再执行任何后续逻辑
+    if player:isDead() then
+        writeDeathSummary(player, "tick")
+        return
+    end
+    deathHandled = false -- 活着（新一局/复活）则重新武装死亡检测
 
     -- 1) 本地紧急逻辑永远最先执行，毫秒级保命
     local nearestDist = emergencyCheck(player)
@@ -738,6 +866,9 @@ local function onTick()
 
     -- 1.5) 反射层生存自动化：吃喝/包扎/装备武器（内部有节流与紧急守卫）
     autoSurvival(player, now)
+
+    -- 1.6) 反射层背包管理：超重自动扔低价值物品减重（内部有节流与紧急守卫）
+    autoManageWeight(player, now)
 
     -- 2) 按间隔写入状态文件（紧急时也写：桥接服务看到 emergency=true 会暂停 LLM 调用）
     if now - lastStateWriteMs >= config.state_write_interval_sec * 1000 then

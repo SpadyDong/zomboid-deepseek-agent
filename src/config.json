@@ -4,7 +4,7 @@
   "max_memory_rounds": 10,
   "max_lessons": 50,
   "seed_lessons": [
-    "负重到八成就收手：carry_weight 达到 carry_max 八成就停止 loot；负重顶格后 flee 会变慢甚至迈不动步，逃命前先扔东西减重。",
+    "负重就是命：carry_weight 达到 carry_max 八成时 loot 会被拒绝，超过上限反射层会自动把低价值物品扔到地面减重；即便如此也别贪，超重后跑不快，逃命前先主动轻装。",
     "三只就是红线：nearby_zombies >= 3 时绝不 attack_nearest，立刻 flee；1 只是练手，2 只是冒险，3 只以上能压垮绝大多数角色。",
     "恐慌先撤再睡：panic 拉满时命中和暴击大打折扣还睡不了觉；先 flee 到附近没有僵尸的 location 把 panic 降下来再 rest。",
     "累了就别打：fatigue 高了近战伤害最多掉九成半、视野收窄；这种状态不 attack_nearest，找安全 location rest 补足睡眠。",
@@ -21,5 +21,7 @@
   "emergency_flee_distance": 10.0,
   "survival_eat_threshold": 0.4,
   "survival_drink_threshold": 0.5,
+  "carry_warn_ratio": 0.8,
+  "carry_drop_ratio": 1.0,
   "state_write_interval_sec": 5
 }

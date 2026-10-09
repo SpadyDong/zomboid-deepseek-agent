@@ -521,6 +521,8 @@ def write_action(decision: dict) -> None:
             "emergency_flee_distance": CONFIG["emergency_flee_distance"],
             "survival_eat_threshold": CONFIG["survival_eat_threshold"],
             "survival_drink_threshold": CONFIG["survival_drink_threshold"],
+            "carry_warn_ratio": CONFIG["carry_warn_ratio"],
+            "carry_drop_ratio": CONFIG["carry_drop_ratio"],
         },
     }
     tmp = ACTION_FILE.with_suffix(".tmp")
@@ -558,6 +560,7 @@ def decision_loop() -> None:
     """轮询状态文件 -> 限频调用 LLM -> 写动作文件。异常永不让线程退出。"""
     log.info("决策循环已启动 | IPC 目录: %s | LLM 间隔: %ss", IPC_DIR, CONFIG["api_interval_sec"])
     last_call = 0.0
+    dead_logged = False                               # 本局死亡是否已记录（每局只记一次）
 
     while True:
         try:
@@ -566,6 +569,14 @@ def decision_loop() -> None:
             state = read_state()
             if state is None:
                 continue                                  # 游戏未启动或模组未写入状态
+            if state.get("dead"):
+                if not dead_logged:
+                    dead_logged = True
+                    # 局总结由 Lua 写入 DeepSeekAI_events.ndjson（type=death_summary），
+                    # 是阶段三调参的「一局结束」信号：存活时长/击杀/死因代理指标
+                    log.warning("检测到玩家死亡：一局结束，暂停 LLM 调用，等待新一局状态")
+                continue                                  # 死亡后不再消耗 token，等新角色状态
+            dead_logged = False
             if state.get("emergency"):
                 continue                                  # 紧急状态由 Lua 本地全权处理，不打扰 LLM
 
