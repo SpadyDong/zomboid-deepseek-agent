@@ -20,7 +20,7 @@
 │  │  ① emergencyCheck 本地紧急逻辑（每 tick，零延迟）       │  │
 │  │     · 僵尸 ≤ 1.5 格：面向僵尸近战攻击                  │  │
 │  │     · 僵尸 ≤ 6.0 格：朝反方向逃跑                      │  │
-│  │  ② 状态采集：每 5s 写 DeepSeekAI_state.json            │  │
+│  │  ② 状态采集：每 5s 写 DeepSeekAI_state.json（背包/负重）│  │
 │  │  ③ 动作执行：读 DeepSeekAI_action.json（非紧急时）      │  │
 │  └──────────┬────────────────────────────▲────────────────┘  │
 └─────────────┼──────── 文件 IPC ──────────┼───────────────────┘
@@ -171,6 +171,16 @@ Agent 具备自我迭代能力，同时支持人工干预，形成三条成长�
 防写坏）。服务重启时自动恢复，LLM 的成长不会丢失。该文件已加入
 `.gitignore`，不会提交。
 
+## 动作执行能力
+
+LLM 每轮从 6 种动作中择一：`move_to` / `loot` / `rest` / `flee` / `idle` / `attack_nearest`，
+其中 loot 与 attack_nearest 已在 Lua 侧闭环，结果经 `last_action_result` 回传：
+
+- **loot**：搜刮当前格与相邻 8 格的容器，仅收集 Food/FirstAid/Weapon/Container/Literature
+  类物品；单容器最多 5 件、单次最多 2 个容器，容器不在当前格会先走向该格再转移。
+- **attack_nearest**：仅当危险距离内僵尸 ≤2 才接受（否则拒绝）；锁定后本地逻辑每 tick
+  追击、贴脸近战；目标死亡即完成，目标 >25 格或附近僵尸 ≥3 时熔断中止并恢复逃跑。
+
 ## HTTP API 一览
 
 | 方法 | 路径 | 说明 |
@@ -192,8 +202,8 @@ Agent 具备自我迭代能力，同时支持人工干预，形成三条成长�
   贴脸近战、紧急逃跑永远由 Lua 本地逻辑处理。请勿修改这一分层。
 - **API 失败降级**：DeepSeek 不可达/超时/返回非法 JSON 时，桥接服务不改写
   动作文件，角色继续执行旧策略，不会卡死原地。
-- **原型阶段**：`loot`（搜刮）与 `attack_nearest`（主动攻击）动作暂以
-  占位方式降级处理（记录日志不执行），后续版本实现。
+- **实机验证中**：`loot` 与 `attack_nearest` 的 Lua 实现尚未在真实游戏内
+  验证，首次实机运行请观察控制台日志。
 - **Token 成本**：默认 30s 一次 LLM 调用 + 记忆窗口 10 轮 + 上下文 6000 字符
   截断，长时间挂机仍会产生 API 费用，请留意额度。
 - 所有可调参数集中在 `src/config.json`，Lua 侧每次读取动作文件时
@@ -214,7 +224,9 @@ curl -X POST http://127.0.0.1:8765/strategy/test \
        "thirst": 40, "fatigue": 20, "panic": 0, "infected": false,
        "hour": 9, "nearby_zombies": 2, "nearest_zombie_dist": 8.5,
        "emergency": false, "current_action": "idle",
-       "last_action_result": "none"}}'
+       "last_action_result": "none",
+       "inventory": [{"name": "Base.Apple", "count": 2}],
+       "carry_weight": 3.2, "carry_max": 8}}'
 
 # 查看 Agent 记忆与反思历史
 curl http://127.0.0.1:8765/memory
@@ -252,7 +264,8 @@ curl -X POST http://127.0.0.1:8765/goal/phase/done
   文件 IPC 链路打通、LLM 策略循环、记忆与反思、紧急逻辑兜底、降级保护。
 - **阶段二：能力迭代**（当前）
   经验系统（失败自动提炼教训 + 人工注入）、临时/阶段目标系统、
-  Agent 状态持久化，AI 可在不修改代码的前提下持续积累经验。
+  Agent 状态持久化，AI 可在不修改代码的前提下持续积累经验；
+  loot/attack_nearest 动作闭环与背包状态上报已完成。
 - **阶段三：参数自动调优**
   `src/config.json` 中阈值已外置且支持热更新；后续让 Agent 根据死亡/受伤
   反馈自动调整 `zombie_danger_distance`、`api_interval_sec` 等参数。

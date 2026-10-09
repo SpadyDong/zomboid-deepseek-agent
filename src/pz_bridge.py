@@ -110,6 +110,12 @@ BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstri
 MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
 
 IPC_DIR = detect_ipc_dir()
+# 启动即确保 IPC 目录存在，避免写动作文件时因 FileNotFoundError 崩溃
+try:
+    IPC_DIR.mkdir(parents=True, exist_ok=True)
+except OSError as e:
+    # 目录创建失败（如权限不足）不中断启动，与「API 失败降级不卡死」的容错风格一致
+    print(f"警告：无法创建 IPC 目录 {IPC_DIR}（{e}），后续写入动作文件可能失败。")
 STATE_FILE = IPC_DIR / "DeepSeekAI_state.json"    # Lua 写入，Python 读取
 ACTION_FILE = IPC_DIR / "DeepSeekAI_action.json"  # Python 写入，Lua 读取
 
@@ -157,10 +163,10 @@ SYSTEM_PROMPT = """你是《僵尸毁灭工程 Project Zomboid》中的一名 AI
 【动作类型说明】
 - move_to: 移动到指定坐标（探索、前往资源点、回安全屋）
 - flee:    战略性转移（远离当前区域，给出远处目标坐标）
-- loot:    在当前建筑搜刮物资
+- loot:    搜刮当前位置及相邻格的容器（仅当你已身处建筑内或紧贴容器建筑时使用；不在建筑旁请先 move_to 接近再 loot）。失败原因会通过上一轮结果评估反馈
 - rest:    原地休息恢复体力
 - idle:    按兵不动，继续观察
-- attack_nearest: 主动攻击最近的僵尸（仅在数量少且状态好时）
+- attack_nearest: 主动追击并消灭最近的僵尸（仅当 nearby_zombies <= 2 且自身 health 良好时使用；僵尸过多会被拒绝执行）
 """
 
 
