@@ -251,6 +251,17 @@ class AgentMemory:
             self.lessons = self.lessons[-self.max_lessons:]
         return True
 
+    def merge_seed_lessons(self, seeds: list | None) -> None:
+        """合并仓库内置的种子经验（多机部署时随仓库分发的基础生存知识）。
+
+        必须在 load() 之后调用。按文本去重：本机已积累的经验不受影响，
+        重复启动不会重复注入；仓库新增种子时下次启动自动补齐。
+        """
+        added = sum(1 for t in seeds or [] if self.add_lesson(t, source="human"))
+        if added:
+            log.info("合并仓库种子经验 %d 条（首次部署或仓库新增种子）", added)
+            self.save()
+
     # ---------------- 目标系统 ----------------
 
     def set_temporary_goal(self, text: str, expires_rounds: int | None) -> None:
@@ -563,6 +574,7 @@ app = FastAPI(title="PZ DeepSeek Bridge", version="0.2.0")
 @app.on_event("startup")
 def _startup() -> None:
     MEMORY.load()                                         # 恢复上次的记忆/经验/目标
+    MEMORY.merge_seed_lessons(CONFIG.get("seed_lessons"))  # 合并仓库内置的基础生存经验
     t = threading.Thread(target=decision_loop, daemon=True)
     t.start()
 
