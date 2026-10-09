@@ -519,11 +519,35 @@ def write_action(decision: dict) -> None:
             "zombie_danger_distance": CONFIG["zombie_danger_distance"],
             "zombie_melee_distance": CONFIG["zombie_melee_distance"],
             "emergency_flee_distance": CONFIG["emergency_flee_distance"],
+            "survival_eat_threshold": CONFIG["survival_eat_threshold"],
+            "survival_drink_threshold": CONFIG["survival_drink_threshold"],
         },
     }
     tmp = ACTION_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     tmp.replace(ACTION_FILE)                              # 原子替换，避免 Lua 读到半截文件
+
+
+def append_decision_log(state: dict, evaluation: str, decision: dict, test: bool = False) -> None:
+    """把每轮「状态 → 结果评估 → 决策」追加为一行 NDJSON，供离线复盘使用。
+
+    这是后续离线迭代（阶段三调参 / 阶段四 Lua 代码进化）的评估器数据源：
+    回放这些记录即可检验候选逻辑在相同历史处境下的表现差异。
+    source 标记区分真实游戏与 /strategy/test 的测试记录，回放时可过滤。
+    """
+    record = {
+        "ts": time.time(),
+        "round": MEMORY.round_count,
+        "source": "test" if test else "game",
+        "evaluation": evaluation,
+        "state": state,
+        "decision": decision,
+    }
+    try:
+        with open(LOG_DIR / "decisions.ndjson", "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError as e:
+        log.warning("决策复盘日志写入失败（不影响决策循环）: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -556,8 +580,11 @@ def decision_loop() -> None:
             if decision is None:
                 continue                                  # 失败不改写动作文件，沿用旧策略
 
+            # 结果评估必须在 process_decision 更新 prev_state 之前取，保证与提示词一致
+            evaluation = MEMORY.outcome_summary(state)
             MEMORY.process_decision(state, decision)
             write_action(decision)
+            append_decision_log(state, evaluation, decision)
             log.info("第 %d 轮决策: %s", MEMORY.round_count, decision.get("immediate_action", {}))
 
         except Exception:
@@ -713,6 +740,9 @@ def strategy_test(body: TestState) -> dict:
     messages = MEMORY.build_messages(body.state)
     decision = call_deepseek(messages)
     if decision is not None:
+        # 与决策循环一致：先取结果评估再落地，测试记录带 source=test 便于回放过滤
+        evaluation = MEMORY.outcome_summary(body.state)
         MEMORY.process_decision(body.state, decision)
         write_action(decision)
+        append_decision_log(body.state, evaluation, decision, test=True)
     return {"decision": decision, "memory_rounds": MEMORY.round_count}

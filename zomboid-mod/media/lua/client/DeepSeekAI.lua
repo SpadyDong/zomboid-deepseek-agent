@@ -184,6 +184,9 @@ local config = {
     zombie_melee_distance    = 1.5,  -- 僵尸进入此距离：触发贴脸近战
     emergency_flee_distance  = 10.0, -- 逃跑时朝反方向移动的距离
     state_write_interval_sec = 5,    -- 状态文件写入间隔（秒）
+    survival_eat_threshold   = 0.4,  -- 饥饿超过此值（0~1）：自动吃背包里的食物
+    survival_drink_threshold = 0.5,  -- 口渴超过此值（0~1）：自动喝水
+    survival_check_interval_ms = 3000, -- 生存自动化检查间隔（毫秒），防止动作队列刷屏
 }
 
 -- 文件读写工具（相对根目录 = 用户目录/Zomboid/Lua/）
@@ -204,6 +207,19 @@ local function writeJsonFile(filename, tbl)
     local writer = getFileWriter(filename, true, false)
     if not writer then return end
     writer:write(json.encode(tbl))
+    writer:close()
+end
+
+-- 事件复盘日志：逐行追加 NDJSON（每条事件开-写-关，游戏崩溃最多丢一条）
+-- 与桥接服务的 decisions.ndjson 互补，供 AI 离线复盘、迭代 Lua 代码
+local function logEvent(eventType, details)
+    local writer = getFileWriter("DeepSeekAI_events.ndjson", true, true) -- 追加模式
+    if not writer then return end
+    local rec = { ts = getTimestampMs(), type = eventType }
+    if type(details) == "table" then
+        for k, v in pairs(details) do rec[k] = v end
+    end
+    writer:write(json.encode(rec) .. "\n")
     writer:close()
 end
 
@@ -232,6 +248,7 @@ local lastFleeMs = 0                   -- 上次下发逃跑指令的时间戳�
 local lastPursueMs = 0                 -- 上次下发追击移动指令的时间戳（防止动作队列刷屏）
 local manualTarget = nil               -- attack_nearest 锁定的目标僵尸（nil 表示当前无主动攻击目标）
 local lastActionTimestamp = 0          -- 动作文件的 updated_at，用于识别新决策
+local lastSurvivalMs = 0               -- 上次执行生存自动化检查的时间戳
 
 -- ---------------------------------------------------------------------------
 -- 僵尸探测
@@ -517,6 +534,129 @@ local function doLoot(player)
 end
 
 -- ---------------------------------------------------------------------------
+-- 生存自动化（反射层）：吃喝/包扎/装备武器即时处理，不占用 LLM 决策
+-- API 用法参照 B41 实战模组 SuperiorSurvivors_Revisited（EatFoodTask /
+-- FirstAideTask / EquipWeaponTask）。注意：只搜索主背包（doLoot 搜刮的
+-- 物品也放入主背包），吃/喝/包扎的 isValid 均要求物品在主背包。
+-- ---------------------------------------------------------------------------
+
+-- 找最值得吃的食物：排除有毒/变质/黑名单物品，按解饿值选最优
+local function findFood(inv)
+    local blacklist = { Bleach = true, Cigarettes = true, HCCigar = true, Antibiotics = true }
+    local items = inv:getItems()
+    local best, bestScore = nil, 0
+    for i = 0, items:size() - 1 do                    -- Java 列表从 0 开始遍历
+        local item = items:get(i)
+        if item:getCategory() == "Food"
+           and item:getPoisonPower() <= 1             -- 排除漂白剂/被下毒
+           and not blacklist[item:getType()]
+           and not item:IsRotten() then               -- 排除变质食物
+            local score = -item:getHungerChange()     -- 解饿值为负，取反后越大越好
+            if score > bestScore then best, bestScore = item, score end
+        end
+    end
+    return best
+end
+
+-- 找可饮用的水（排除漂白剂）
+local function findWater(inv)
+    local items = inv:getItems()
+    for i = 0, items:size() - 1 do
+        local item = items:get(i)
+        if item:isWaterSource() and item:getType() ~= "Bleach" then
+            return item
+        end
+    end
+    return nil
+end
+
+-- 找绷带：绷带/碎布均可，取绷带强度最高者
+local function findBandage(inv)
+    local items = inv:getItems()
+    local best, bestPow = nil, 0
+    for i = 0, items:size() - 1 do
+        local item = items:get(i)
+        if item:isCanBandage() and item:getBandagePower() > bestPow then
+            best, bestPow = item, item:getBandagePower()
+        end
+    end
+    return best
+end
+
+-- 找伤害最高的武器（过滤伤害过低的“武器类杂物”）
+local function findBestWeapon(inv)
+    local items = inv:getItems()
+    local best, bestDmg = nil, 0.1
+    for i = 0, items:size() - 1 do
+        local item = items:get(i)
+        if item:getCategory() == "Weapon" and item:getMaxDamage() > bestDmg then
+            best, bestDmg = item, item:getMaxDamage()
+        end
+    end
+    return best
+end
+
+-- 生存自动化主入口：满足条件立即排队对应动作（带节流与守卫）
+local function autoSurvival(player, nowMs)
+    if nowMs - lastSurvivalMs < config.survival_check_interval_ms then return end
+    if player:isInAction() then return end      -- 正在执行动作（走路/吃喝/包扎中）时不打断
+    lastSurvivalMs = nowMs
+    if emergencyActive then return end          -- 紧急状态只做保命，生存自动化全部暂停
+
+    local inv = player:getInventory()
+
+    -- 1) 流血最优先：包扎第一个流血且未包扎的部位（拖久了会失血致死）
+    local bodyparts = player:getBodyDamage():getBodyParts()
+    for i = 0, bodyparts:size() - 1 do
+        local bp = bodyparts:get(i)
+        if bp:bleeding() and not bp:bandaged() then
+            local bandage = findBandage(inv)
+            if bandage then
+                ISTimedActionQueue.add(ISApplyBandage:new(player, player, bandage, bp, true))
+                logEvent("auto_bandage", { item = bandage:getType() })
+            end
+            return
+        end
+    end
+
+    -- 2) 饥饿：自动吃下解饿值最高的食物（每次吃 1/4，饿了再吃）
+    local stats = player:getStats()
+    if stats:getHunger() > config.survival_eat_threshold then
+        local food = findFood(inv)
+        if food then
+            ISTimedActionQueue.add(ISEatFoodAction:new(player, food, 0.25))
+            logEvent("auto_eat", { item = food:getType(), hunger = stats:getHunger() })
+        end
+        return
+    end
+
+    -- 3) 口渴：按口渴程度喝水（复刻原版 onDrinkForThirst 的份数算法）
+    if stats:getThirst() > config.survival_drink_threshold then
+        local water = findWater(inv)
+        if water then
+            local units = math.min(math.ceil(stats:getThirst() / 0.1), 10, water:getDrainableUsesInt())
+            if units > 0 then
+                ISTimedActionQueue.add(ISDrinkFromBottle:new(player, water, units))
+                logEvent("auto_drink", { item = water:getType(), thirst = stats:getThirst() })
+            end
+        end
+        return
+    end
+
+    -- 4) 主手为空且背包有武器：自动装备最好的武器（双手武器需同步副手）
+    if player:getPrimaryHandItem() == nil then
+        local weapon = findBestWeapon(inv)
+        if weapon then
+            player:setPrimaryHandItem(weapon)
+            if weapon:isRequiresEquippedBothHands() then
+                player:setSecondaryHandItem(weapon)
+            end
+            logEvent("auto_equip", { item = weapon:getType() })
+        end
+    end
+end
+
+-- ---------------------------------------------------------------------------
 -- 动作执行：读取 DeepSeekAI_action.json，执行 LLM 的高层决策（非紧急时）
 -- ---------------------------------------------------------------------------
 local function executeAction(player)
@@ -579,11 +719,13 @@ local function executeAction(player)
     else
         lastActionResult = "failed: 未知动作类型 " .. tostring(atype)
     end
+    -- 每个 LLM 动作的执行结果也记入复盘日志（与桥接侧 decisions.ndjson 互补）
+    logEvent("llm_action", { action = tostring(atype), result = lastActionResult })
 end
 
 -- ---------------------------------------------------------------------------
 -- 主循环：每个游戏 tick 触发
--- 执行顺序严格固定：紧急逻辑 -> 状态写入 -> LLM 动作执行
+-- 执行顺序严格固定：紧急逻辑 -> 生存自动化 -> 状态写入 -> LLM 动作执行
 -- ---------------------------------------------------------------------------
 local function onTick()
     local player = getSpecificPlayer(0)
@@ -593,6 +735,9 @@ local function onTick()
     local nearestDist = emergencyCheck(player)
 
     local now = getTimestampMs()
+
+    -- 1.5) 反射层生存自动化：吃喝/包扎/装备武器（内部有节流与紧急守卫）
+    autoSurvival(player, now)
 
     -- 2) 按间隔写入状态文件（紧急时也写：桥接服务看到 emergency=true 会暂停 LLM 调用）
     if now - lastStateWriteMs >= config.state_write_interval_sec * 1000 then

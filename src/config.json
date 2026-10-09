@@ -8,10 +8,10 @@
     "三只就是红线：nearby_zombies >= 3 时绝不 attack_nearest，立刻 flee；1 只是练手，2 只是冒险，3 只以上能压垮绝大多数角色。",
     "恐慌先撤再睡：panic 拉满时命中和暴击大打折扣还睡不了觉；先 flee 到附近没有僵尸的 location 把 panic 降下来再 rest。",
     "累了就别打：fatigue 高了近战伤害最多掉九成半、视野收窄；这种状态不 attack_nearest，找安全 location rest 补足睡眠。",
-    "挂彩先保命再补血：injured 或 health 下降时先 flee 拉开 danger_distance，脱战立刻包扎；之后 move_to 药店/诊所/医院 loot，优先 FirstAid 类容器，流血拖不得。",
+    "挂彩先保命：injured 或 health 下降时先 flee 拉开 danger_distance，脱战后反射层会自动包扎止血；之后 move_to 药店/诊所/医院 loot 补充 FirstAid 物资，流血拖不得。",
     "距离就是命，走别跑：danger_distance 还大时就提前 flee，步行本来就快过普通僵尸，跑步白烧耐力还引怪；被贴上就连着拐弯穿屋打破视线再拉开距离。",
-    "搜刮认死顺序：基础五件套（背包、武器、水容器、食物、绷带）没齐之前别想着打，loot 按 包>武器>水>食物>绷带 的顺序；手上没有武器时绝不 attack_nearest。",
-    "吃喝就是战斗力：hunger、thirst 任一飘高都会砍负重上限、拖慢回血；开打前先 loot 食物和水，又饿又渴时宁可 stay 原地吃喝也别硬接 attack_nearest。"
+    "搜刮认死顺序：基础五件套（背包、武器、水容器、食物、绷带）没齐之前别想着打，loot 按 包>武器>水>食物>绷带 的顺序；inventory 里没有武器时绝不 attack_nearest（反射层会自动装备背包里最好的武器）。",
+    "吃喝靠存货：反射层会自动吃喝背包里的食物和水，但存货耗尽就会挨饿；hunger、thirst 任一飘高时优先 loot 食物和水，别硬接 attack_nearest。"
   ],
   "max_context_chars": 6000,
   "reflect_every_n_rounds": 5,
@@ -19,5 +19,7 @@
   "zombie_danger_distance": 6.0,
   "zombie_melee_distance": 1.5,
   "emergency_flee_distance": 10.0,
+  "survival_eat_threshold": 0.4,
+  "survival_drink_threshold": 0.5,
   "state_write_interval_sec": 5
 }
