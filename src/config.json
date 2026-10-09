@@ -1,0 +1,12 @@
+{
+  "api_interval_sec": 30,
+  "api_timeout_sec": 60,
+  "max_memory_rounds": 10,
+  "max_context_chars": 6000,
+  "reflect_every_n_rounds": 5,
+  "state_poll_interval_sec": 2,
+  "zombie_danger_distance": 6.0,
+  "zombie_melee_distance": 1.5,
+  "emergency_flee_distance": 10.0,
+  "state_write_interval_sec": 5
+}

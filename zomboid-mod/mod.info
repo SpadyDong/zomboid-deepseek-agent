@@ -1,0 +1,6 @@
+name=DeepSeek AI Survivor
+id=DeepSeekAI
+description=DeepSeek 驱动的 AI 幸存者：LLM 负责高层生存策略，本地 Lua 负责紧急保命与近战。需要配合 Python 桥接服务使用，详见 https://github.com/SpadyDong/zomboid-deepseek-agent
+author=SpadyDong
+versionMin=41.78
+url=https://github.com/SpadyDong/zomboid-deepseek-agent

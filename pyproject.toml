@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zomboid-deepseek-agent"
+version = "0.1.0"
+description = "《僵尸毁灭工程》DeepSeek AI 幸存者：LLM 高层策略 + Lua 本地紧急保命逻辑"
+readme = "README.md"
+license = { text = "AGPL-3.0-only" }
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi",
+    "uvicorn",
+    "requests",
+]
+
+# 本目录仅为运行脚本集合，不作为可分发的 Python 包安装
+[tool.setuptools]
+packages = []
