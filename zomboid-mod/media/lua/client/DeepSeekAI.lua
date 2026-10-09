@@ -229,6 +229,8 @@ local lastActionResult = "none"        -- 上一个动作的执行结果（写�
 local lastStateWriteMs = 0             -- 上次写状态文件的时间戳
 local lastActionReadMs = 0             -- 上次读动作文件的时间戳
 local lastFleeMs = 0                   -- 上次下发逃跑指令的时间戳（防止动作队列刷屏）
+local lastPursueMs = 0                 -- 上次下发追击移动指令的时间戳（防止动作队列刷屏）
+local manualTarget = nil               -- attack_nearest 锁定的目标僵尸（nil 表示当前无主动攻击目标）
 local lastActionTimestamp = 0          -- 动作文件的 updated_at，用于识别新决策
 
 -- ---------------------------------------------------------------------------
@@ -264,6 +266,54 @@ end
 -- ---------------------------------------------------------------------------
 local function emergencyCheck(player)
     local zombie, dist = findNearestZombie(player)
+
+    -- 主动攻击模式：LLM 下发 attack_nearest 后，本地接管追击/近战，
+    -- 直到目标消灭、敌人增多或目标过远才交还默认逻辑
+    if manualTarget ~= nil then
+        -- a) 目标失效（死亡或被引擎回收）：pcall 防止访问失效对象时报错
+        local ok, targetDist = pcall(function()
+            if manualTarget:isAlive() then
+                return manualTarget:DistTo(player)
+            end
+            return nil
+        end)
+        if not ok or targetDist == nil then
+            manualTarget = nil
+            currentAction = "idle"
+            lastActionResult = "executed: 目标已消灭"
+            player:NPCSetAttack(false)
+            player:NPCSetAiming(false)
+            -- 清除目标后继续走下方默认逻辑
+        elseif countZombies(player, config.zombie_danger_distance) >= 3 then
+            -- b) 敌人增多：中止攻击，交还默认逃跑逻辑保命
+            manualTarget = nil
+            lastActionResult = "failed: 敌人增多，中止攻击"
+        elseif targetDist > 25 then
+            -- c) 目标过远：放弃追击
+            manualTarget = nil
+            lastActionResult = "failed: 目标过远"
+        else
+            -- d) 追击/近战：贴脸直接打，否则每秒重新下发一次走向目标的移动
+            emergencyActive = true
+            if targetDist <= config.zombie_melee_distance then
+                player:faceThisObject(manualTarget)
+                player:setRunning(false)
+                player:NPCSetAiming(true)
+                player:NPCSetAttack(true)
+            else
+                player:NPCSetAttack(false)
+                player:NPCSetAiming(false)
+                local now = getTimestampMs()
+                if now - lastPursueMs > 1000 then
+                    lastPursueMs = now
+                    ISTimedActionQueue.clear(player)
+                    ISTimedActionQueue.add(ISWalkToTimedAction:new(player,
+                        math.floor(manualTarget:getX()), math.floor(manualTarget:getY()), manualTarget:getZ()))
+                end
+            end
+            return targetDist -- 主动攻击期间不走默认逃跑分支
+        end
+    end
 
     if not zombie then
         -- 附近没有僵尸：解除紧急状态
@@ -318,9 +368,37 @@ end
 -- ---------------------------------------------------------------------------
 -- 状态采集：写入 DeepSeekAI_state.json，供桥接服务读取
 -- ---------------------------------------------------------------------------
+
+-- 采集背包状态：物品按类型名称聚合计数（降序截断前 20 条），并附负重信息
+local function collectInventory(player)
+    local inv = player:getInventory()
+    local items = inv:getItems()
+    local counts = {}
+    for i = 0, items:size() - 1 do
+        local name = items:get(i):getType()
+        counts[name] = (counts[name] or 0) + 1
+    end
+    -- 转成 {name, count} 数组后按数量降序排序，截断前 20 条以控制状态文件体积
+    local sorted = {}
+    for name, count in pairs(counts) do
+        sorted[#sorted + 1] = { name = name, count = count }
+    end
+    table.sort(sorted, function(a, b) return a.count > b.count end)
+    local top = {}
+    for i = 1, math.min(20, #sorted) do
+        top[i] = sorted[i]
+    end
+    return {
+        inventory = top,        -- 空背包时为空数组（本文件 JSON 编码器会编成 {}，可接受）
+        carry_weight = math.floor(inv:getCapacityWeight() * 10 + 0.5) / 10, -- 保留 1 位小数
+        carry_max = inv:getCapacity(),
+    }
+end
+
 local function collectState(player, nearestDist)
     local stats = player:getStats()
     local body = player:getBodyDamage()
+    local invState = collectInventory(player)
     return {
         x = math.floor(player:getX()),
         y = math.floor(player:getY()),
@@ -338,8 +416,104 @@ local function collectState(player, nearestDist)
         emergency = emergencyActive,
         current_action = currentAction,
         last_action_result = lastActionResult,
+        inventory = invState.inventory,       -- 背包物品聚合（供 LLM 决策吃什么/用什么）
+        carry_weight = invState.carry_weight, -- 当前负重
+        carry_max = invState.carry_max,       -- 负重上限
         updated_at = getTimestampMs(),
     }
+end
+
+-- ---------------------------------------------------------------------------
+-- 搜刮：在玩家当前格及相邻 8 格内寻找容器，收集有价值物品
+-- ---------------------------------------------------------------------------
+
+-- 有价值物品类别过滤表（只收集这些类别的物品）
+local lootCategories = {
+    Food = true,
+    FirstAid = true,
+    Weapon = true,
+    Container = true,
+    Literature = true,
+}
+
+local function doLoot(player)
+    local sq = player:getCurrentSquare()
+    if not sq then
+        lastActionResult = "failed: 无法获取当前格子"
+        return
+    end
+
+    -- 收集当前格 + 相邻 8 格（相邻格可能不存在，需判 nil）
+    local squares = { sq }
+    local dirs = {
+        IsoDirections.N, IsoDirections.S, IsoDirections.E, IsoDirections.W,
+        IsoDirections.NE, IsoDirections.NW, IsoDirections.SE, IsoDirections.SW,
+    }
+    for _, dir in ipairs(dirs) do
+        local adj = sq:getAdjacentSquare(dir)
+        if adj then squares[#squares + 1] = adj end
+    end
+
+    -- 在所有格子中找出带容器的对象（一个对象可能有多个容器）
+    local found = {} -- 元素：{ container = 容器, square = 所在格 }
+    for _, s in ipairs(squares) do
+        local objs = s:getObjects()
+        for i = 0, objs:size() - 1 do
+            local obj = objs:get(i)
+            if obj and obj:getContainerCount() > 0 then
+                for ci = 0, obj:getContainerCount() - 1 do
+                    local container = obj:getContainerByIndex(ci)
+                    if container then
+                        found[#found + 1] = { container = container, square = s }
+                    end
+                end
+            end
+        end
+    end
+
+    if #found == 0 then
+        lastActionResult = "failed: 附近没有可搜刮容器"
+        return
+    end
+
+    -- 限量：单次 loot 最多处理 2 个容器，每个容器最多取 5 件
+    local lootedCount = 0
+    local handled = 0
+    for _, entry in ipairs(found) do
+        if handled >= 2 then break end
+        local container = entry.container
+        -- 先把有价值物品收集到临时表，避免边遍历边从容器删除
+        local toTake = {}
+        local items = container:getItems()
+        for i = 0, items:size() - 1 do
+            local item = items:get(i)
+            if item and lootCategories[item:getCategory()] then
+                toTake[#toTake + 1] = item
+                if #toTake >= 5 then break end
+            end
+        end
+        if #toTake > 0 then
+            -- 容器不在玩家当前格：先走过去（原型简化：仍直接转移物品，不等走到）
+            if entry.square ~= sq then
+                ISTimedActionQueue.clear(player)
+                ISTimedActionQueue.add(ISWalkToTimedAction:new(player,
+                    entry.square:getX(), entry.square:getY(), entry.square:getZ()))
+            end
+            for _, item in ipairs(toTake) do
+                player:getInventory():AddItem(item)
+                container:Remove(item)
+                lootedCount = lootedCount + 1
+            end
+            handled = handled + 1
+        end
+    end
+
+    if lootedCount > 0 then
+        currentAction = "loot"
+        lastActionResult = "executed: loot 获得 " .. lootedCount .. " 件物品"
+    else
+        lastActionResult = "failed: 容器中没有有用物品"
+    end
 end
 
 -- ---------------------------------------------------------------------------
@@ -385,11 +559,23 @@ local function executeAction(player)
     elseif atype == "idle" then
         currentAction = "idle"
         lastActionResult = "executed"
-    elseif atype == "loot" or atype == "attack_nearest" then
-        -- 原型阶段降级：复杂交互待后续版本实现，先跳过不执行
-        currentAction = atype
-        lastActionResult = "pending: " .. atype .. " 待实现"
-        print("[DeepSeekAI] 动作 " .. atype .. " 原型阶段暂未实现，已跳过")
+    elseif atype == "loot" then
+        doLoot(player)
+    elseif atype == "attack_nearest" then
+        -- 主动攻击前先评估局势：危险距离内僵尸过多则拒绝送死
+        if countZombies(player, config.zombie_danger_distance) > 2 then
+            lastActionResult = "failed: 僵尸过多，拒绝主动攻击"
+        else
+            local target = findNearestZombie(player)
+            if not target then
+                lastActionResult = "failed: 附近没有僵尸"
+            else
+                -- 锁定目标，之后每 tick 由 emergencyCheck 的主动攻击分支接管追击/近战
+                manualTarget = target
+                currentAction = "attack_nearest"
+                lastActionResult = "executed: 开始追击目标"
+            end
+        end
     else
         lastActionResult = "failed: 未知动作类型 " .. tostring(atype)
     end
