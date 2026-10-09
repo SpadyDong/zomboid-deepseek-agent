@@ -2,6 +2,7 @@
   "api_interval_sec": 30,
   "api_timeout_sec": 60,
   "max_memory_rounds": 10,
+  "max_lessons": 50,
   "max_context_chars": 6000,
   "reflect_every_n_rounds": 5,
   "state_poll_interval_sec": 2,
